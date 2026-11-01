@@ -1,0 +1,30 @@
+# Production edge: HTTPS (automatic certificates for SENTINELOPS_SITE_ADDRESS), static web app,
+# /api and health endpoints proxied to the API. The API trusts X-Forwarded-For only from this
+# proxy's network (SENTINELOPS_TRUSTED_PROXIES).
+{
+	admin off
+}
+
+{$SENTINELOPS_SITE_ADDRESS:localhost} {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+		-Server
+	}
+	@api path /api/* /healthz /readyz
+	handle @api {
+		reverse_proxy api:8000 {
+			flush_interval -1
+		}
+	}
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

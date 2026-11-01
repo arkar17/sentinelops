@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api:
+    name: API (lint, typecheck, unit + integration tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/api
+    services:
+      # Disposable CI database. Trust auth on the runner-local service: no credentials committed.
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: sentinelops_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d sentinelops_test"
+          --health-interval 2s --health-timeout 5s --health-retries 20
+    env:
+      SENTINELOPS_TEST_DATABASE_URL: postgresql+asyncpg://postgres@127.0.0.1:5432/sentinelops_test
+      SENTINELOPS_REQUIRE_INTEGRATION: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.13.6"
+          enable-cache: true
+          cache-dependency-glob: apps/api/uv.lock
+      - name: Install
+        run: uv sync --frozen
+      - name: Ruff lint
+        run: uv run ruff check .
+      - name: Ruff format
+        run: uv run ruff format --check .
+      - name: Pyright
+        run: uv run pyright
+      - name: Import boundaries
+        run: uv run lint-imports
+      - name: Pytest (unit + integration, includes migration verification)
+        run: uv run pytest
+      - name: Build package
+        run: uv build
+
+  web:
+    name: Web (lint, typecheck, tests, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: ESLint
+        run: npm run lint
+      - name: TypeScript
+        run: npm run typecheck
+      - name: Vitest
+        run: npm test
+      - name: Build
+        run: npm run build
+
+  containers:
+    name: Compose config and image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate compose files (no credentials needed)
+        run: |
+          docker compose config --quiet --no-interpolate
+          docker compose -f deploy/compose.prod.yaml config --quiet --no-interpolate
+      - name: Build API image
+        run: docker build --target api -t sentinelops-api:ci apps/api
+      - name: Build worker image
+        run: docker build --target worker -t sentinelops-worker:ci apps/api
+      - name: Build notifier image
+        run: docker build --target notifier -t sentinelops-notifier:ci apps/api
+      - name: Build web images (dev and production)
+        run: |
+          docker build --target dev -t sentinelops-web:ci apps/web
+          docker build --target production -t sentinelops-web-prod:ci apps/web
+
+  e2e:
+    name: Browser E2E (Playwright, Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      # Disposable CI database; the harness refuses anything but a local sentinelops_test.
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: sentinelops_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d sentinelops_test"
+          --health-interval 2s --health-timeout 5s --health-retries 20
+    env:
+      SENTINELOPS_TEST_DATABASE_URL: postgresql+asyncpg://postgres@127.0.0.1:5432/sentinelops_test
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.13.6"
+          enable-cache: true
+          cache-dependency-glob: apps/api/uv.lock
+      - name: Install API
+        working-directory: apps/api
+        run: uv sync --frozen
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Install web
+        working-directory: apps/web
+        run: npm ci
+      - name: Install Chromium
+        working-directory: apps/web
+        run: npx playwright install --with-deps chromium
+      - name: Playwright (desktop + mobile Chromium)
+        working-directory: apps/web
+        run: npx playwright test
+      - name: Upload report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            apps/web/playwright-report
+            apps/web/test-results
+          retention-days: 7
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.13.6"
+      - name: Python dependencies (pip-audit, all groups)
+        working-directory: apps/api
+        run: |
+          uv export --frozen --no-hashes --no-emit-project > /tmp/requirements.txt
+          uvx --from pip-audit==2.9.0 pip-audit --strict -r /tmp/requirements.txt
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: npm production dependencies (fail on high or critical)
+        working-directory: apps/web
+        run: npm audit --omit=dev --audit-level=high
+      - name: npm all dependencies (report only; dev tooling findings are triaged in docs/SECURITY.md)
+        working-directory: apps/web
+        run: npm audit || true

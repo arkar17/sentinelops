@@ -1,0 +1,122 @@
+# Local development stack. Requires a .env file (copy .env.example); there are no default credentials.
+# Ports bind to 127.0.0.1 only. Migrations never run automatically: use `docker compose run --rm migrate`
+# only after explicit approval (04_IMPLEMENTATION_PLAN_CLAUDE_PRO.md §4).
+name: sentinelops
+
+x-api-env: &api-env
+  SENTINELOPS_ENV: ${SENTINELOPS_ENV:-development}
+  SENTINELOPS_LOG_LEVEL: ${SENTINELOPS_LOG_LEVEL:-INFO}
+  SENTINELOPS_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB in .env}
+  SENTINELOPS_PUBLIC_BASE_URL: http://localhost:5173
+  SENTINELOPS_ALLOWED_ORIGINS: '["http://localhost:5173", "http://127.0.0.1:5173"]'
+  # Development mail catcher; nothing leaves the machine. UI: http://127.0.0.1:8025
+  SENTINELOPS_SMTP_HOST: mailpit
+  SENTINELOPS_SMTP_PORT: "1025"
+  SENTINELOPS_SMTP_STARTTLS: "false"
+  # Organization-secret encryption keys (ADR-015); generate locally, never commit.
+  SENTINELOPS_SECRET_KEYS: ${SENTINELOPS_SECRET_KEYS:?set SENTINELOPS_SECRET_KEYS in .env}
+  SENTINELOPS_SECRET_ACTIVE_KEY_ID: ${SENTINELOPS_SECRET_ACTIVE_KEY_ID:?set SENTINELOPS_SECRET_ACTIVE_KEY_ID in .env}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ./apps/api
+      target: api
+    environment: *api-env
+    command: ["uvicorn", "--factory", "sentinelops.api.app:create_app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers", "--reload", "--reload-dir", "/app/src"]
+    volumes:
+      - ./apps/api/src:/app/src:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+
+  # Development-only SMTP catcher for invitations, activation and password reset emails.
+  mailpit:
+    image: axllent/mailpit:v1.27.0
+    ports:
+      - "127.0.0.1:8025:8025"
+
+  web:
+    build:
+      context: ./apps/web
+      target: dev
+    environment:
+      VITE_API_PROXY_TARGET: http://api:8000
+    volumes:
+      - ./apps/web/src:/app/src:ro
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      - api
+
+  # Manual only. Applies Alembic migrations; requires explicit approval for every target database.
+  # Runs as the database owner. The API's least-privilege login role is a G7 deployment task.
+  migrate:
+    build:
+      context: ./apps/api
+      target: api
+    profiles: ["manual"]
+    environment: *api-env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Operator CLI, e.g. bootstrap of the first SYSTEM_ADMIN (requires explicit approval):
+  #   docker compose run --rm api sentinelops bootstrap-system-admin --email you@example.com
+
+  # Probe worker (G3). Opt-in profile: it makes outbound HTTP(S) checks to verified domains.
+  # NET_ADMIN lets its entrypoint install the egress firewall before dropping to uid 10001;
+  # without the capability it refuses to start.
+  worker:
+    build:
+      context: ./apps/api
+      target: worker
+    profiles: ["workers"]
+    environment:
+      <<: *api-env
+      SENTINELOPS_EGRESS_ALLOW: "postgres:5432"
+    cap_add: ["NET_ADMIN"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Notification delivery (G5). Opt-in profile: email goes only to the configured platform relay
+  # (mailpit in development); Telegram only to api.telegram.org for channels an organization set up.
+  # NET_ADMIN lets its entrypoint install a default-deny egress firewall (database, SMTP relay,
+  # Telegram ranges) before dropping to uid 10001; without the capability it refuses to start.
+  notifier:
+    build:
+      context: ./apps/api
+      target: notifier
+    profiles: ["workers"]
+    environment:
+      <<: *api-env
+      SENTINELOPS_EGRESS_ALLOW: "postgres:5432 mailpit:1025"
+    cap_add: ["NET_ADMIN"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

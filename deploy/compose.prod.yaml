@@ -1,0 +1,123 @@
+# Production-oriented stack (single host). Not deployed by this repository.
+#   docker compose -f deploy/compose.prod.yaml --env-file deploy/.env.production up -d
+# Secrets come only from the env file (never committed; see docs/ENVIRONMENT.md). Migrations run
+# only by hand:  docker compose -f deploy/compose.prod.yaml --env-file ... run --rm migrate
+# There are no seeds, resets or automatic migrations.
+name: sentinelops-prod
+
+x-runtime: &runtime
+  SENTINELOPS_ENV: production
+  SENTINELOPS_LOG_LEVEL: ${SENTINELOPS_LOG_LEVEL:-INFO}
+  # Least-privilege login role (member of sentinelops_app; created per docs/operations/RUNBOOK.md).
+  SENTINELOPS_DATABASE_URL: postgresql+asyncpg://${APP_DB_USER:?}:${APP_DB_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
+  SENTINELOPS_PUBLIC_BASE_URL: https://${SENTINELOPS_SITE_ADDRESS:?}
+  SENTINELOPS_ALLOWED_ORIGINS: '["https://${SENTINELOPS_SITE_ADDRESS}"]'
+  SENTINELOPS_TRUSTED_PROXIES: '["10.89.0.0/24"]'
+  SENTINELOPS_SECRET_KEYS: ${SENTINELOPS_SECRET_KEYS:?}
+  SENTINELOPS_SECRET_ACTIVE_KEY_ID: ${SENTINELOPS_SECRET_ACTIVE_KEY_ID:?}
+  SENTINELOPS_MFA_KEYS: ${SENTINELOPS_MFA_KEYS:?}
+  SENTINELOPS_MFA_ACTIVE_KEY_ID: ${SENTINELOPS_MFA_ACTIVE_KEY_ID:?}
+  SENTINELOPS_SMTP_HOST: ${SENTINELOPS_SMTP_HOST:?}
+  SENTINELOPS_SMTP_PORT: ${SENTINELOPS_SMTP_PORT:-587}
+  SENTINELOPS_SMTP_USERNAME: ${SENTINELOPS_SMTP_USERNAME:-}
+  SENTINELOPS_SMTP_PASSWORD: ${SENTINELOPS_SMTP_PASSWORD:-}
+  SENTINELOPS_SMTP_FROM: ${SENTINELOPS_SMTP_FROM:?}
+
+x-hardening: &hardening
+  restart: unless-stopped
+  read_only: true
+  tmpfs: ["/tmp", "/run"]
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "5" }
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?}  # owner / migrator, never used by the app processes
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: ${POSTGRES_DB:?}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    build: { context: ../apps/api, target: api }
+    profiles: ["manual"]
+    environment:
+      SENTINELOPS_ENV: production
+      SENTINELOPS_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
+      SENTINELOPS_MFA_KEYS: ${SENTINELOPS_MFA_KEYS:?}
+      SENTINELOPS_MFA_ACTIVE_KEY_ID: ${SENTINELOPS_MFA_ACTIVE_KEY_ID:?}
+    command: ["alembic", "upgrade", "head"]
+    networks: [data]
+    depends_on: { postgres: { condition: service_healthy } }
+
+  api:
+    <<: *hardening
+    build: { context: ../apps/api, target: api }
+    environment: *runtime
+    cap_drop: [ALL]
+    networks:
+      data: {}
+      edge: { ipv4_address: 10.89.0.10 }
+    depends_on: { postgres: { condition: service_healthy } }
+    stop_grace_period: 30s
+
+  worker:
+    <<: *hardening
+    build: { context: ../apps/api, target: worker }
+    environment:
+      <<: *runtime
+      SENTINELOPS_EGRESS_ALLOW: "postgres:5432"
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, SETUID, SETGID]  # firewall setup, then setpriv to uid 10001
+    networks: [data, egress]
+    depends_on: { postgres: { condition: service_healthy } }
+    stop_grace_period: 75s  # worker_shutdown_grace_seconds (60 s) + margin
+
+  notifier:
+    <<: *hardening
+    build: { context: ../apps/api, target: notifier }
+    environment:
+      <<: *runtime
+      SENTINELOPS_EGRESS_ALLOW: "postgres:5432 ${SENTINELOPS_SMTP_HOST}:${SENTINELOPS_SMTP_PORT:-587}"
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, SETUID, SETGID]
+    networks: [data, egress]
+    depends_on: { postgres: { condition: service_healthy } }
+    stop_grace_period: 30s
+
+  web:
+    build: { context: ../apps/web, target: production }
+    restart: unless-stopped
+    environment:
+      SENTINELOPS_SITE_ADDRESS: ${SENTINELOPS_SITE_ADDRESS:?}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      edge: { ipv4_address: 10.89.0.2 }
+    depends_on: [api]
+
+networks:
+  data:
+    internal: true  # database traffic never leaves the host network
+  edge:
+    ipam:
+      config: [{ subnet: 10.89.0.0/24 }]
+  egress: {}
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
